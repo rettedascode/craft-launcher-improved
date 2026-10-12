@@ -353,7 +353,9 @@ impl LauncherUi {
                 }
                 fresh
             }
-            Event::Mcp(report) => {
+            Event::Mcp(mut report) => {
+                // Listed with the installed tools first.
+                report.tools.sort_by_key(|tool| !tool.found);
                 self.mcp = Some(report);
                 self.mcp_busy = false;
                 false

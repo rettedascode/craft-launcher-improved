@@ -301,19 +301,11 @@ fn quote(s: &str) -> String {
 }
 
 /// `value` as JSON text whose first line continues a line at `depth` and whose closing bracket
-/// sits at `depth`. Arrays of plain values stay on one line (`["mcp"]`), as people write them.
+/// sits at `depth`. Lists stay on one line (`["mcp"]`), as people write them.
 fn render(value: &Value, depth: usize, style: &Style, inline: bool) -> String {
     match value {
         Value::Object(map) => render_fields(map.iter().map(|(k, v)| (k.as_str(), v)), depth, style, inline),
-        Value::Array(items) if items.is_empty() => "[]".into(),
-        Value::Array(items) if inline || items.iter().all(|v| !v.is_object() && !v.is_array()) => {
-            format!("[{}]", items.iter().map(|v| render(v, depth, style, true)).collect::<Vec<_>>().join(", "))
-        }
-        Value::Array(items) => {
-            let inner = style.at(depth + 1);
-            let body: Vec<String> = items.iter().map(|v| format!("{inner}{}", render(v, depth + 1, style, false))).collect();
-            format!("[{nl}{}{nl}{}]", body.join(&format!(",{}", style.newline)), style.at(depth), nl = style.newline)
-        }
+        Value::Array(items) => format!("[{}]", items.iter().map(|v| render(v, depth, style, true)).collect::<Vec<_>>().join(", ")),
         other => serde_json::to_string(other).unwrap_or_else(|_| "null".into()),
     }
 }
@@ -382,22 +374,10 @@ pub fn set(text: &str, container: &str, name: &str, fields: &[(&str, Value)]) ->
     let style = Style::of(text);
     let entry = |depth: usize, inline: bool| render_fields(fields.iter().map(|(k, v)| (*k, v)), depth, &style, inline);
     let Some(root) = &doc.root else {
-        // A blank file (or only comments): start the object after whatever is there.
-        let object = format!(
-            "{{{nl}{i1}{}: {{{nl}{i2}{}: {}{nl}{i1}}}{nl}}}",
-            quote(container),
-            quote(name),
-            entry(2, false),
-            nl = style.newline,
-            i1 = style.at(1),
-            i2 = style.at(2),
-        );
+        // A blank file (or only comments): an empty object after whatever is there, then as usual.
         let lead = text.trim_end();
-        return Ok(if lead.trim_start_matches('\u{feff}').is_empty() {
-            format!("{lead}{object}{}", style.newline)
-        } else {
-            format!("{lead}{nl}{object}{nl}", nl = style.newline)
-        });
+        let gap = if lead.trim_start_matches('\u{feff}').is_empty() { "" } else { style.newline };
+        return set(&format!("{lead}{gap}{{}}{}", style.newline), container, name, fields);
     };
     match doc.container()? {
         Some(node) => {
@@ -423,24 +403,22 @@ pub fn set(text: &str, container: &str, name: &str, fields: &[(&str, Value)]) ->
 /// there.
 pub fn remove(text: &str, container: &str, name: &str) -> Result<String, String> {
     let mut text = text.to_string();
-    // Each pass removes the last duplicate; a file with more than this many is not worth saving.
+    // One pass for each copy of the name, the last first. A file with more copies than this is
+    // not worth saving.
     for _ in 0..64 {
         let doc = parse(&text, container)?;
         let Some(node) = doc.container()? else { return Ok(text) };
         let list = members(node).unwrap_or_default();
         let Some((i, m)) = find(list, name) else { return Ok(text) };
+        let copies = list.iter().filter(|m| m.key == name).count();
         let blank = |s: Option<&str>| s.is_some_and(|s| s.trim().is_empty());
-        let (mut start, mut end) = match (m.comma, i.checked_sub(1).and_then(|p| list.get(p))) {
+        let after = m.comma.map_or(m.value.end, |c| c + 1);
+        if list.len() == 1 && blank(text.get(node.start + 1..m.key_start)) && blank(text.get(after..node.end - 1)) {
             // The only member, with nothing else inside: back to `{}`.
-            (_, None)
-                if list.len() == 1
-                    && blank(text.get(node.start + 1..m.key_start))
-                    && blank(text.get(m.comma.map_or(m.value.end, |c| c + 1)..node.end - 1)) =>
-            {
-                text = splice(&text, node.start + 1, node.end - 1, "");
-                continue;
-            }
-            (Some(c), _) => (m.key_start, c + 1),
+            return Ok(splice(&text, node.start + 1, node.end - 1, ""));
+        }
+        let (mut start, mut end) = match (m.comma, i.checked_sub(1).and_then(|p| list.get(p))) {
+            (Some(_), _) => (m.key_start, after),
             // The last member: take the comma before it instead.
             (None, Some(prev)) => (prev.value.end, m.value.end),
             (None, None) => (m.key_start, m.value.end),
@@ -455,6 +433,9 @@ pub fn remove(text: &str, container: &str, name: &str) -> Result<String, String>
             end += text.get(end..).map_or(0, |s| s.len() - s.trim_start_matches([' ', '\t']).len());
         }
         text = splice(&text, start, end, "");
+        if copies == 1 {
+            return Ok(text);
+        }
     }
     Err(format!("\"{name}\" appears too many times"))
 }

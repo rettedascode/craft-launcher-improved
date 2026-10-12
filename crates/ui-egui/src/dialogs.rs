@@ -280,9 +280,7 @@ impl LauncherUi {
             ui.label(RichText::new(tl!("Let AI assistants such as Claude, Codex or Cursor work in the Craft apps through MCP.")).color(t.muted));
             ui.add_space(6.0);
             if widgets::button(ui, tl!("Connect to AI tools…"), Kind::Secondary, 0.0).clicked() {
-                // Replaces this dialog.
                 self.open_ai_tools(None);
-                return false;
             }
         }
 

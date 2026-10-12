@@ -1,7 +1,7 @@
 //! The AI tools dialog: adds the Craft apps' MCP servers to the settings of AI tools (Claude,
 //! Codex, Cursor, VS Code…), or takes them out again.
 
-use artcraft_launcher_core::mcp::{AiTool, Entry, McpServer};
+use artcraft_launcher_core::mcp::{AiTool, Entry, McpReport, McpServer};
 use artcraft_launcher_core::protocol::Command;
 use artcraft_launcher_core::{CraftApp, SUITE};
 use egui::RichText;
@@ -27,15 +27,22 @@ impl LauncherUi {
         self.send(Command::McpScan);
     }
 
+    /// Asks the backend to add (`connect`) or remove `apps` in `tool`'s settings. The buttons wait
+    /// until it has answered.
+    fn connect(&mut self, tool: &AiTool, apps: &[&CraftApp], connect: bool) {
+        self.mcp_busy = true;
+        self.send(Command::McpConnect { tool: tool.id.clone(), apps: apps.iter().map(|a| a.id.to_string()).collect(), connect });
+    }
+
     /// Returns whether to close.
     pub(crate) fn ai_tools_dialog(&mut self, ui: &mut egui::Ui, scope: Option<&str>) -> bool {
         let t = Tokens::get(ui.ctx());
         ui.set_width(600.0f32.min(ui.ctx().content_rect().width() - 80.0));
         let icon = scope.and_then(crate::icons::app).unwrap_or_else(crate::icons::artcraft_mark);
         Self::title(ui, Some(icon), tl!("AI tools"), "Model Context Protocol");
-        // One line, so the catalogs' coverage test finds the text.
-        #[rustfmt::skip]
-        let intro = tl!("Let AI assistants such as Claude, Codex or Cursor work in the Craft apps. ArtCraft Launcher adds each app's MCP server to the settings the AI tool uses for all your projects. Restart the AI tool after a change.");
+        let intro = tl!(
+            "Let AI assistants such as Claude, Codex or Cursor work in the Craft apps. ArtCraft Launcher adds each app's MCP server to the settings the AI tool uses for all your projects. Restart the AI tool after a change."
+        );
         ui.add(egui::Label::new(RichText::new(intro).color(t.muted)).wrap());
         ui.add_space(14.0);
 
@@ -59,75 +66,31 @@ impl LauncherUi {
         }
         ui.add_space(10.0);
 
-        let mut close = false;
-        let Some(report) = self.mcp.clone() else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(tl!("Looking for AI tools…")).color(t.muted));
-            });
-            ui.add_space(14.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = widgets::button(ui, tl!("Done"), Kind::Primary, 90.0).clicked();
-            });
-            return close;
-        };
-
-        // The apps in scope (every app of the suite for "all", so leftovers can be removed), and
-        // those whose server can be started here.
-        let all: Vec<&'static CraftApp> = match scope {
-            Some(id) => CraftApp::by_id(id).into_iter().collect(),
-            None => SUITE.iter().collect(),
-        };
-        let ready: Vec<(&'static CraftApp, McpServer)> =
-            all.iter().filter_map(|a| report.servers.get(a.id).and_then(|s| s.as_ref().ok()).map(|s| (*a, s.clone()))).collect();
-        let note = |ui: &mut egui::Ui, text: &str, color| {
-            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
-        };
-        for app in &all {
-            if let Some(Err(why)) = report.servers.get(app.id) {
-                note(ui, &format!("{}: {}", app.name, msg(why)), t.warn);
+        // The report leaves `self` while the list is drawn: the list's buttons need `self` too.
+        let report = self.mcp.take();
+        let ready = match &report {
+            Some(report) => self.tool_list(ui, scope, report),
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(tl!("Looking for AI tools…")).color(t.muted));
+                });
+                Vec::new()
             }
-        }
-        if ready.is_empty() && all.iter().all(|a| !report.servers.contains_key(a.id)) {
-            note(ui, tl!("Install an app first to use it with AI tools."), t.muted);
-        }
-        ui.add_space(6.0);
-
-        // Installed tools first.
-        let mut tools = report.tools.clone();
-        tools.sort_by_key(|tool| !tool.found);
-        let ids: Vec<&str> = all.iter().map(|a| a.id).collect();
-        // Its full height at once (left to grow into the dialog it would open a row per frame):
-        // half the window, less where the window is too short for the rest of the dialog.
-        let window = ui.ctx().content_rect().height();
-        let height = (window * 0.5).min(window - 420.0).max(120.0);
-        let width = ui.available_width();
-        let list = ui.available_rect_before_wrap();
-        let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list.with_max_x(list.right() + SCROLL_GUTTER)));
-        egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, true]).show(&mut list_ui, |ui| {
-            ui.set_max_width(width);
-            let mut missing_shown = false;
-            for tool in &tools {
-                if !tool.found && !missing_shown {
-                    missing_shown = true;
-                    ui.add_space(12.0);
-                    widgets::hud(ui, tl!("Not found on this computer"), t.faint);
-                    ui.add_space(4.0);
-                }
-                self.tool_row(ui, tool, &ids, &ready);
-            }
-        });
-        // The list's height, without its gutter's width.
-        ui.allocate_rect(egui::Rect::from_min_size(list.min, egui::vec2(width, list_ui.min_rect().height())), egui::Sense::hover());
+        };
+        self.mcp = report;
 
         ui.add_space(16.0);
+        let mut close = false;
         ui.horizontal(|ui| {
-            let servers: Vec<(&str, &McpServer)> = ready.iter().map(|(a, s)| (a.id, s)).collect();
             let copy = ui
-                .add_enabled_ui(!servers.is_empty(), |ui| widgets::button(ui, tl!("Copy configuration"), Kind::Secondary, 0.0))
+                .add_enabled_ui(!ready.is_empty(), |ui| widgets::button(ui, tl!("Copy configuration"), Kind::Secondary, 0.0))
                 .inner
                 .on_hover_text(tl!("Copies the MCP settings of these apps, for an AI tool that isn't listed"));
-            if copy.clicked() {
+            if copy.clicked()
+                && let Some(report) = &self.mcp
+            {
+                let servers: Vec<(&str, &McpServer)> = ready.iter().filter_map(|a| Some((a.id, report.servers.get(a.id)?.as_ref().ok()?))).collect();
                 ui.ctx().copy_text(McpServer::snippet(&servers));
                 let ctx = ui.ctx().clone();
                 self.toast(&ctx, tl!("Copied to the clipboard"), false);
@@ -139,19 +102,65 @@ impl LauncherUi {
         close
     }
 
+    /// Why some apps can't be connected, then the AI tools, the installed ones first. Returns the
+    /// apps in scope whose server can be started here.
+    fn tool_list(&mut self, ui: &mut egui::Ui, scope: Option<&str>, report: &McpReport) -> Vec<&'static CraftApp> {
+        let t = Tokens::get(ui.ctx());
+        // The apps in scope: for "all", every app of the suite, so what an app that is gone left
+        // behind can be removed too.
+        let all: Vec<&'static CraftApp> = match scope {
+            Some(id) => CraftApp::by_id(id).into_iter().collect(),
+            None => SUITE.iter().collect(),
+        };
+        let ready: Vec<&'static CraftApp> = all.iter().copied().filter(|a| matches!(report.servers.get(a.id), Some(Ok(_)))).collect();
+        let note = |ui: &mut egui::Ui, text: &str, color| {
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
+        };
+        for app in &all {
+            if let Some(Err(why)) = report.servers.get(app.id) {
+                note(ui, &format!("{}: {}", app.name, msg(why)), t.warn);
+            }
+        }
+        if all.iter().all(|a| !report.servers.contains_key(a.id)) {
+            note(ui, tl!("Install an app first to use it with AI tools."), t.muted);
+        }
+        ui.add_space(6.0);
+
+        // The list's full height at once (left to grow into the dialog it would open a row per
+        // frame): half the window, less where the window is too short for the rest of the dialog.
+        let window = ui.ctx().content_rect().height();
+        let height = (window * 0.5).min(window - 420.0).max(120.0);
+        let width = ui.available_width();
+        let list = ui.available_rect_before_wrap();
+        let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list.with_max_x(list.right() + SCROLL_GUTTER)));
+        egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, true]).show(&mut list_ui, |ui| {
+            ui.set_max_width(width);
+            let mut missing_shown = false;
+            for tool in &report.tools {
+                if !tool.found && !missing_shown {
+                    missing_shown = true;
+                    ui.add_space(12.0);
+                    widgets::hud(ui, tl!("Not found on this computer"), t.faint);
+                    ui.add_space(4.0);
+                }
+                self.tool_row(ui, tool, &all, &ready);
+            }
+        });
+        // The list's height, without its gutter's width.
+        ui.allocate_rect(egui::Rect::from_min_size(list.min, egui::vec2(width, list_ui.min_rect().height())), egui::Sense::hover());
+        ready
+    }
+
     /// One AI tool: its name and settings file, whether the apps in scope are connected, and the
     /// buttons that change that. `all` is every app in scope; `ready` those that can be added.
-    fn tool_row(&mut self, ui: &mut egui::Ui, tool: &AiTool, all: &[&str], ready: &[(&'static CraftApp, McpServer)]) {
+    fn tool_row(&mut self, ui: &mut egui::Ui, tool: &AiTool, all: &[&'static CraftApp], ready: &[&'static CraftApp]) {
         let t = Tokens::get(ui.ctx());
-        let state = |id: &str| tool.entries.get(id).copied();
-        let current = ready.iter().filter(|(a, _)| state(a.id) == Some(Entry::Current)).count();
-        let to_add: Vec<String> =
-            ready.iter().filter(|(a, _)| !matches!(state(a.id), Some(Entry::Current | Entry::Foreign))).map(|(a, _)| a.id.to_string()).collect();
-        let updating = !to_add.is_empty() && to_add.iter().all(|id| state(id) == Some(Entry::Different));
-        let to_remove: Vec<String> =
-            all.iter().filter(|id| matches!(state(id), Some(Entry::Current | Entry::Different))).map(|id| (*id).to_string()).collect();
-        let foreign: Vec<&str> =
-            all.iter().filter(|id| state(id) == Some(Entry::Foreign)).filter_map(|id| CraftApp::by_id(id)).map(|a| a.name).collect();
+        let state = |app: &CraftApp| tool.entries.get(app.id).copied();
+        let current = ready.iter().filter(|a| state(a) == Some(Entry::Current)).count();
+        let to_add: Vec<&CraftApp> = ready.iter().copied().filter(|a| !matches!(state(a), Some(Entry::Current | Entry::Foreign))).collect();
+        let updating = !to_add.is_empty() && to_add.iter().all(|a| state(a) == Some(Entry::Different));
+        let to_remove: Vec<&CraftApp> = all.iter().copied().filter(|a| matches!(state(a), Some(Entry::Current | Entry::Different))).collect();
+        let foreign: Vec<&str> = all.iter().filter(|a| state(a) == Some(Entry::Foreign)).map(|a| a.name).collect();
 
         ui.add_space(8.0);
         // One line across the list. The buttons and the status go in from the right; the name
@@ -161,15 +170,11 @@ impl LauncherUi {
         let enabled = !self.mcp_busy && tool.error.is_none();
         controls.add_enabled_ui(enabled, |ui| {
             if !to_remove.is_empty() && widgets::button(ui, tl!("Remove"), Kind::Secondary, 0.0).clicked() {
-                self.mcp_busy = true;
-                self.send(Command::McpConnect { tool: tool.id.clone(), apps: to_remove.clone(), connect: false });
+                self.connect(tool, &to_remove, false);
             }
-            if !to_add.is_empty() {
-                let label = if updating { tl!("Update") } else { tl!("Add") };
-                if widgets::button(ui, label, Kind::Primary, 0.0).clicked() {
-                    self.mcp_busy = true;
-                    self.send(Command::McpConnect { tool: tool.id.clone(), apps: to_add.clone(), connect: true });
-                }
+            let add = if updating { tl!("Update") } else { tl!("Add") };
+            if !to_add.is_empty() && widgets::button(ui, add, Kind::Primary, 0.0).clicked() {
+                self.connect(tool, &to_add, true);
             }
         });
         if tool.error.is_some() {
@@ -187,7 +192,8 @@ impl LauncherUi {
         let name_font = egui::FontId::new(egui::TextStyle::Body.resolve(ui.style()).size, theme::medium());
         let path_font = egui::FontId::new(theme::HUD_SIZE, theme::mono());
         let line = |font: &egui::FontId| ui.painter().layout_no_wrap(" ".to_string(), font.clone(), t.ink).size().y;
-        let (gap, pair) = (2.0, line(&name_font) + 2.0 + line(&path_font));
+        let gap = 2.0;
+        let pair = line(&name_font) + gap + line(&path_font);
         let text =
             egui::Rect::from_min_max(egui::pos2(row.left(), row.center().y - pair / 2.0), egui::pos2(text_right.max(row.left()), row.bottom()));
         let mut names = ui.new_child(egui::UiBuilder::new().max_rect(text).layout(egui::Layout::top_down(egui::Align::Min)));
@@ -204,8 +210,7 @@ impl LauncherUi {
             ui.add(egui::Label::new(RichText::new(text).size(12.0).color(t.muted)).wrap());
         }
         ui.add_space(8.0);
-        let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-        ui.painter().hline(rect.x_range(), rect.center().y, t.hairline());
+        let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().hline(rule.x_range(), rule.center().y, t.hairline());
     }
 }

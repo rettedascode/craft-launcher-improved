@@ -17,6 +17,7 @@ use artcraft_launcher_core::{CraftApp, InstallSource, Installed, Os, SUITE};
 use serde_json::{Value, json};
 
 use crate::jsonc;
+use crate::process::which_on_path;
 
 /// The biggest settings file the launcher reads (Claude Code's grows with its project history).
 const MAX_SIZE: u64 = 64 << 20;
@@ -103,44 +104,44 @@ impl Shape {
     }
 }
 
-/// The program and arguments a JSON entry starts, in any of the dialects above (and Zed's older
+/// What a JSON entry starts, in any of the dialects above (and Zed's older
 /// `"command": {"path", "args"}`). `None` for entries that start no program (a remote server).
-fn started_by(entry: &Value) -> Option<(String, Vec<String>)> {
+fn started_by(entry: &Value) -> Option<McpServer> {
     let strings = |v: Option<&Value>| -> Option<Vec<String>> {
         match v {
             None => Some(Vec::new()),
             Some(v) => v.as_array()?.iter().map(|s| s.as_str().map(str::to_string)).collect(),
         }
     };
-    match entry.get("command")? {
-        Value::String(program) => Some((program.clone(), strings(entry.get("args"))?)),
+    let command = entry.get("command")?;
+    let (command, args) = match command {
+        Value::String(program) => (program.clone(), strings(entry.get("args"))?),
         Value::Array(_) => {
-            let mut all = strings(entry.get("command"))?;
-            (!all.is_empty()).then(|| {
-                let program = all.remove(0);
-                (program, all)
-            })
+            let all = strings(Some(command))?;
+            let (program, args) = all.split_first()?;
+            (program.clone(), args.to_vec())
         }
-        Value::Object(cmd) => Some((cmd.get("path")?.as_str()?.to_string(), strings(cmd.get("args"))?)),
-        _ => None,
-    }
+        Value::Object(cmd) => (cmd.get("path")?.as_str()?.to_string(), strings(cmd.get("args"))?),
+        _ => return None,
+    };
+    Some(McpServer { command, args })
 }
 
-/// Whether `program args` start `app`'s MCP server: its CLI (from any folder) or its Flatpak's,
-/// with the `mcp` subcommand.
-fn is_craft_server(app: &CraftApp, program: &str, args: &[String]) -> bool {
+/// Whether `s` is `app`'s MCP server: its CLI (from any folder) or its Flatpak's, with the `mcp`
+/// subcommand.
+fn is_craft_server(app: &CraftApp, s: &McpServer) -> bool {
     let cli = format!("{}-cli", app.id);
-    let file = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let file = s.command.rsplit(['/', '\\']).next().unwrap_or(&s.command);
     let stem = file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file);
-    let runs_cli = stem.eq_ignore_ascii_case(&cli) || (stem == "flatpak" && args.iter().any(|a| *a == format!("--command={cli}")));
-    runs_cli && args.iter().any(|a| a == "mcp")
+    let runs_cli = stem.eq_ignore_ascii_case(&cli) || (stem == "flatpak" && s.args.iter().any(|a| *a == format!("--command={cli}")));
+    runs_cli && s.args.iter().any(|a| a == "mcp")
 }
 
 /// What an entry under `app`'s name is, given how the launcher would start the server now.
-fn classify(app: &CraftApp, now: Option<&McpServer>, started: Option<&(String, Vec<String>)>) -> Entry {
+fn classify(app: &CraftApp, now: Option<&McpServer>, started: Option<&McpServer>) -> Entry {
     match started {
-        Some((program, args)) if now.is_some_and(|s| s.command == *program && s.args == *args) => Entry::Current,
-        Some((program, args)) if is_craft_server(app, program, args) => Entry::Different,
+        Some(s) if now == Some(s) => Entry::Current,
+        Some(s) if is_craft_server(app, s) => Entry::Different,
         _ => Entry::Foreign,
     }
 }
@@ -165,39 +166,37 @@ impl Tool {
     }
 }
 
+/// Where Claude Desktop from the Microsoft Store keeps its settings: inside its package, not in
+/// `%APPDATA%\Claude` (the copy its own "Edit Config" button opens). Each is (the file, the
+/// package's folder).
+fn store_claude_desktop(local: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let Ok(packages) = std::fs::read_dir(local.join("Packages")) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = packages
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Claude_") || n.contains(".Claude_")))
+        .collect();
+    found.sort();
+    found.into_iter().map(|package| (package.join("LocalCache").join("Roaming").join("Claude").join("claude_desktop_config.json"), package)).collect()
+}
+
 /// The AI tools, in the order they're listed.
 fn tools(b: &Bases) -> Vec<Tool> {
     let home = &b.home;
     let tool = |id, name, shape, places: Vec<(PathBuf, PathBuf)>| Tool { id, name, shape, places };
-    // A settings file whose folder exists when the tool is installed.
-    let in_dir = |dir: PathBuf, file: &str| vec![(dir.join(file), dir)];
+    // A settings file in a folder that is there when the tool is installed.
+    let in_dir = |dir: PathBuf, file: &str| (dir.join(file), dir);
+    // A settings file that is only there once the tool has been used.
+    let itself = |file: PathBuf| (file.clone(), file);
 
-    // Claude Desktop from the Microsoft Store reads its settings from inside its package, not
-    // from %APPDATA%\Claude (the copy its own "Edit Config" button opens).
-    let mut claude_desktop = Vec::new();
-    if b.os == Os::Windows {
-        let packages = b.local.join("Packages");
-        let mut store: Vec<PathBuf> = std::fs::read_dir(&packages)
-            .map(|dir| {
-                dir.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Claude_") || n.contains(".Claude_")))
-                    .collect()
-            })
-            .unwrap_or_default();
-        store.sort();
-        for package in store {
-            claude_desktop.push((package.join("LocalCache").join("Roaming").join("Claude").join("claude_desktop_config.json"), package));
-        }
-    }
-    claude_desktop.extend(in_dir(b.config.join("Claude"), "claude_desktop_config.json"));
-
+    let mut claude_desktop = if b.os == Os::Windows { store_claude_desktop(&b.local) } else { Vec::new() };
+    claude_desktop.push(in_dir(b.config.join("Claude"), "claude_desktop_config.json"));
     let claude_json = b.claude_config_dir.as_ref().unwrap_or(home).join(".claude.json");
     let codex = b.codex_home.clone().unwrap_or_else(|| home.join(".codex"));
     let code = |edition: &str| b.config.join(edition).join("User");
     let extension = |id: &str, file: &str| {
         let dir = code("Code").join("globalStorage").join(id);
-        vec![(dir.join("settings").join(file), dir)]
+        (dir.join("settings").join(file), dir)
     };
     let zed = if b.os == Os::Windows { b.config.join("Zed") } else { b.xdg_config.join("zed") };
     let opencode = b.xdg_config.join("opencode");
@@ -211,33 +210,29 @@ fn tools(b: &Bases) -> Vec<Tool> {
 
     vec![
         tool("claude-desktop", "Claude Desktop", Shape::Plain, claude_desktop),
-        tool("claude-code", "Claude Code", Shape::ClaudeCode, vec![(claude_json.clone(), claude_json.clone()), (claude_json, home.join(".claude"))]),
-        tool("codex", "Codex", Shape::Codex, in_dir(codex, "config.toml")),
-        tool("cursor", "Cursor", Shape::Plain, in_dir(home.join(".cursor"), "mcp.json")),
-        tool("vscode", "VS Code", Shape::VsCode, in_dir(code("Code"), "mcp.json")),
-        tool("vscode-insiders", "VS Code Insiders", Shape::VsCode, in_dir(code("Code - Insiders"), "mcp.json")),
-        tool("windsurf", "Windsurf", Shape::Plain, in_dir(home.join(".codeium").join("windsurf"), "mcp_config.json")),
-        tool("gemini-cli", "Gemini CLI", Shape::Plain, vec![(gemini.join("settings.json"), gemini.join("settings.json"))]),
-        tool("copilot-cli", "GitHub Copilot CLI", Shape::Copilot, in_dir(home.join(".copilot"), "mcp-config.json")),
+        tool("claude-code", "Claude Code", Shape::ClaudeCode, vec![itself(claude_json.clone()), (claude_json, home.join(".claude"))]),
+        tool("codex", "Codex", Shape::Codex, vec![in_dir(codex, "config.toml")]),
+        tool("cursor", "Cursor", Shape::Plain, vec![in_dir(home.join(".cursor"), "mcp.json")]),
+        tool("vscode", "VS Code", Shape::VsCode, vec![in_dir(code("Code"), "mcp.json")]),
+        tool("vscode-insiders", "VS Code Insiders", Shape::VsCode, vec![in_dir(code("Code - Insiders"), "mcp.json")]),
+        tool("windsurf", "Windsurf", Shape::Plain, vec![in_dir(home.join(".codeium").join("windsurf"), "mcp_config.json")]),
+        tool("gemini-cli", "Gemini CLI", Shape::Plain, vec![itself(gemini.join("settings.json"))]),
+        tool("copilot-cli", "GitHub Copilot CLI", Shape::Copilot, vec![in_dir(home.join(".copilot"), "mcp-config.json")]),
+        // The folder its tools share first, its own otherwise.
         tool(
             "antigravity",
             "Antigravity",
             Shape::Plain,
-            [in_dir(gemini.join("config"), "mcp_config.json"), in_dir(gemini.join("antigravity"), "mcp_config.json")].concat(),
+            vec![in_dir(gemini.join("config"), "mcp_config.json"), in_dir(gemini.join("antigravity"), "mcp_config.json")],
         ),
-        tool("zed", "Zed", Shape::Zed, in_dir(zed, "settings.json")),
-        tool("cline", "Cline", Shape::Plain, extension("saoudrizwan.claude-dev", "cline_mcp_settings.json")),
-        tool("roo-code", "Roo Code", Shape::Plain, extension("rooveterinaryinc.roo-cline", "mcp_settings.json")),
+        tool("zed", "Zed", Shape::Zed, vec![in_dir(zed, "settings.json")]),
+        tool("cline", "Cline", Shape::Plain, vec![extension("saoudrizwan.claude-dev", "cline_mcp_settings.json")]),
+        tool("roo-code", "Roo Code", Shape::Plain, vec![extension("rooveterinaryinc.roo-cline", "mcp_settings.json")]),
         tool("kiro", "Kiro", Shape::Plain, vec![(home.join(".kiro").join("settings").join("mcp.json"), home.join(".kiro"))]),
         tool("junie", "Junie", Shape::Plain, vec![(home.join(".junie").join("mcp").join("mcp.json"), home.join(".junie"))]),
-        tool("amazon-q", "Amazon Q Developer", Shape::Plain, in_dir(home.join(".aws").join("amazonq"), "mcp.json")),
-        tool("lm-studio", "LM Studio", Shape::Plain, in_dir(lm_studio, "mcp.json")),
-        tool(
-            "opencode",
-            "opencode",
-            Shape::OpenCode,
-            [vec![(opencode.join("opencode.jsonc"), opencode.join("opencode.jsonc"))], in_dir(opencode, "opencode.json")].concat(),
-        ),
+        tool("amazon-q", "Amazon Q Developer", Shape::Plain, vec![in_dir(home.join(".aws").join("amazonq"), "mcp.json")]),
+        tool("lm-studio", "LM Studio", Shape::Plain, vec![in_dir(lm_studio, "mcp.json")]),
+        tool("opencode", "opencode", Shape::OpenCode, vec![itself(opencode.join("opencode.jsonc")), in_dir(opencode, "opencode.json")]),
     ]
 }
 
@@ -254,33 +249,37 @@ fn read_text(path: &Path) -> Result<Option<String>, String> {
     String::from_utf8(bytes).map(Some).map_err(|_| "it isn't UTF-8 text".into())
 }
 
-/// A TOML error on one line: "TOML parse error at line 3, column 5: invalid string".
-fn toml_error(e: &toml_edit::TomlError) -> String {
-    let text = e.to_string();
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let first = lines.next().unwrap_or("invalid TOML");
-    match lines.next_back() {
-        Some(last) if last != first => format!("{first}: {last}"),
-        _ => first.to_string(),
-    }
+/// `text` as a TOML document that keeps its formatting. An error comes back on one line: "TOML
+/// parse error at line 3, column 5: invalid string".
+fn toml(text: &str) -> Result<toml_edit::DocumentMut, String> {
+    text.parse().map_err(|e: toml_edit::TomlError| {
+        let message = e.to_string();
+        let mut lines = message.lines().map(str::trim).filter(|l| !l.is_empty());
+        let first = lines.next().unwrap_or("invalid TOML");
+        match lines.next_back() {
+            Some(last) if last != first => format!("{first}: {last}"),
+            _ => first.to_string(),
+        }
+    })
 }
 
-/// The servers a settings file lists: name → the program and arguments it starts.
-type Listed = Vec<(String, Option<(String, Vec<String>)>)>;
+/// The servers a settings file lists: name → what it starts (`None`: nothing the launcher can
+/// read as a program). Of two entries with one name the last counts, as the tools read them.
+type Listed = BTreeMap<String, Option<McpServer>>;
 
 fn listed(shape: Shape, text: &str) -> Result<Listed, String> {
     if shape == Shape::Codex {
-        let doc: toml_edit::DocumentMut = text.parse().map_err(|e| toml_error(&e))?;
-        let Some(servers) = doc.get(shape.key()) else { return Ok(Vec::new()) };
+        let doc = toml(text)?;
+        let Some(servers) = doc.get(shape.key()) else { return Ok(Listed::new()) };
         let servers = servers.as_table_like().ok_or("\"mcp_servers\" isn't a table")?;
-        let started = |item: &toml_edit::Item| -> Option<(String, Vec<String>)> {
+        let started = |item: &toml_edit::Item| -> Option<McpServer> {
             let t = item.as_table_like()?;
-            let program = t.get("command")?.as_str()?.to_string();
+            let command = t.get("command")?.as_str()?.to_string();
             let args = match t.get("args") {
                 None => Vec::new(),
                 Some(a) => a.as_array()?.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<_>>()?,
             };
-            Some((program, args))
+            Some(McpServer { command, args })
         };
         return Ok(servers.iter().map(|(name, item)| (name.to_string(), started(item))).collect());
     }
@@ -294,7 +293,7 @@ fn with_server(shape: Shape, text: &str, name: &str, s: &McpServer) -> Result<St
         return jsonc::set(text, shape.key(), name, &shape.fields(s));
     }
     use toml_edit::{Array, Item, Table, value};
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| toml_error(&e))?;
+    let mut doc = toml(text)?;
     let root = doc.as_table_mut();
     if !root.contains_key(shape.key()) {
         // `[mcp_servers.photocraft]` without an empty `[mcp_servers]` above it.
@@ -303,20 +302,13 @@ fn with_server(shape: Shape, text: &str, name: &str, s: &McpServer) -> Result<St
         root.insert(shape.key(), Item::Table(servers));
     }
     let servers = root.get_mut(shape.key()).and_then(Item::as_table_like_mut).ok_or("\"mcp_servers\" isn't a table")?;
-    let args: Array = s.args.iter().map(String::as_str).collect();
-    match servers.get_mut(name).and_then(Item::as_table_like_mut) {
-        // Keep the entry's other settings (env, timeouts).
-        Some(entry) => {
-            entry.insert("command", value(s.command.as_str()));
-            entry.insert("args", value(args));
-        }
-        None => {
-            let mut entry = Table::new();
-            entry.insert("command", value(s.command.as_str()));
-            entry.insert("args", value(args));
-            servers.insert(name, Item::Table(entry));
-        }
+    if servers.get(name).and_then(Item::as_table_like).is_none() {
+        servers.insert(name, Item::Table(Table::new()));
     }
+    // An entry that was there keeps its other settings (env, timeouts).
+    let entry = servers.get_mut(name).and_then(Item::as_table_like_mut).ok_or("the entry isn't a table")?;
+    entry.insert("command", value(s.command.as_str()));
+    entry.insert("args", value(s.args.iter().map(String::as_str).collect::<Array>()));
     Ok(doc.to_string())
 }
 
@@ -325,7 +317,7 @@ fn without_server(shape: Shape, text: &str, name: &str) -> Result<String, String
     if shape != Shape::Codex {
         return jsonc::remove(text, shape.key(), name);
     }
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| toml_error(&e))?;
+    let mut doc = toml(text)?;
     let removed = doc.get_mut(shape.key()).and_then(toml_edit::Item::as_table_like_mut).and_then(|t| t.remove(name)).is_some();
     Ok(if removed { doc.to_string() } else { text.to_string() })
 }
@@ -337,18 +329,14 @@ pub fn scan(bases: &Bases, servers: &BTreeMap<String, Result<McpServer, String>>
         .into_iter()
         .map(|tool| {
             let (path, found) = tool.target();
-            let read = read_text(&path).and_then(|text| text.map_or_else(|| Ok(Vec::new()), |t| listed(tool.shape, &t)));
+            let read = read_text(&path).and_then(|text| text.map_or_else(|| Ok(Listed::new()), |t| listed(tool.shape, &t)));
             let (entries, error) = match read {
                 Ok(list) => {
-                    let entries = SUITE
-                        .iter()
-                        .filter_map(|app| {
-                            let (_, started) = list.iter().rev().find(|(name, _)| name == app.id)?;
-                            let now = servers.get(app.id).and_then(|s| s.as_ref().ok());
-                            Some((app.id.to_string(), classify(app, now, started.as_ref())))
-                        })
-                        .collect();
-                    (entries, None)
+                    let entry = |app: &CraftApp| {
+                        let now = servers.get(app.id).and_then(|s| s.as_ref().ok());
+                        Some((app.id.to_string(), classify(app, now, list.get(app.id)?.as_ref())))
+                    };
+                    (SUITE.iter().filter_map(entry).collect(), None)
                 }
                 Err(e) => (BTreeMap::new(), Some(e)),
             };
@@ -396,9 +384,8 @@ pub fn change(
     let mut text = original.clone().unwrap_or_default();
     let list = listed(tool.shape, &text).map_err(failed)?;
     let (mut done, mut already, mut kept): (Vec<&CraftApp>, Vec<&CraftApp>, Vec<&CraftApp>) = Default::default();
-    for (app, server) in apps {
-        let app: &CraftApp = app;
-        let entry = list.iter().rev().find(|(name, _)| name == app.id).map(|(_, started)| classify(app, server.as_ref(), started.as_ref()));
+    for &(app, ref server) in apps {
+        let entry = list.get(app.id).map(|started| classify(app, server.as_ref(), started.as_ref()));
         match (connect, entry, server) {
             (_, Some(Entry::Foreign), _) => kept.push(app),
             (true, Some(Entry::Current), _) => already.push(app),
@@ -432,10 +419,7 @@ pub fn change(
 /// gets the old one's permissions (Claude Code's is private to the user).
 fn save(path: &Path, text: &str, original: Option<&str>, backup: &Path) -> Result<(), String> {
     if let Some(old) = original {
-        if let Some(dir) = backup.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("couldn't keep a copy in {} ({e})", dir.display()))?;
-        }
-        std::fs::write(backup, old).map_err(|e| format!("couldn't keep a copy at {} ({e})", backup.display()))?;
+        crate::paths::write_atomic(backup, old.as_bytes()).map_err(|e| format!("couldn't keep a copy of it first: {e}"))?;
     }
     let dir = path.parent().ok_or("it has no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
@@ -451,19 +435,14 @@ fn save(path: &Path, text: &str, original: Option<&str>, backup: &Path) -> Resul
     })
 }
 
-/// A program on `PATH`.
-fn on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_absolute() && p.is_file())
-}
-
 /// How to start `app`'s MCP server on this machine: `<app>-cli mcp`, from where the app is
 /// installed. The error says why it can't be started, for the user.
 pub fn server_for(app: &CraftApp, installed: &Installed) -> Result<McpServer, String> {
     let cli = format!("{}-cli{}", app.id, std::env::consts::EXE_SUFFIX);
     match installed.source {
         InstallSource::Flatpak => {
-            let flatpak = on_path("flatpak").map_or_else(|| "flatpak".to_string(), |p| p.display().to_string());
+            // By its full path where there is one: an AI tool's own PATH may be shorter.
+            let flatpak = which_on_path("flatpak").filter(|p| p.is_absolute()).map_or_else(|| "flatpak".to_string(), |p| p.display().to_string());
             let args = vec!["run".to_string(), format!("--command={}-cli", app.id), app.bundle_id(), "mcp".to_string()];
             Ok(McpServer { command: flatpak, args })
         }
@@ -482,7 +461,7 @@ pub fn server_for(app: &CraftApp, installed: &Installed) -> Result<McpServer, St
             } else if let Some(dir) = location.parent() {
                 candidates.push(dir.join(&cli));
             }
-            candidates.extend(on_path(&cli));
+            candidates.extend(which_on_path(&cli));
             if cfg!(unix) {
                 candidates.extend(["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"].iter().map(|d| Path::new(d).join(&cli)));
                 if let Some(home) = dirs::home_dir() {
@@ -587,7 +566,7 @@ mod tests {
     fn tells_craft_servers_from_other_entries() {
         let app = photo();
         let now = server(r"C:\Program Files\PhotoCraft\photocraft-cli.exe");
-        let entry = |p: &str, args: &[&str]| (p.to_string(), args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let entry = |p: &str, args: &[&str]| McpServer { command: p.to_string(), args: args.iter().map(|s| s.to_string()).collect() };
         assert_eq!(classify(app, Some(&now), Some(&entry(r"C:\Program Files\PhotoCraft\photocraft-cli.exe", &["mcp"]))), Entry::Current);
         assert_eq!(classify(app, Some(&now), Some(&entry(r"D:\Old\PhotoCraft-CLI.EXE", &["mcp", "--connect", "7979"]))), Entry::Different);
         assert_eq!(classify(app, None, Some(&entry("/home/me/photocraft/target/release/photocraft-cli", &["mcp"]))), Entry::Different);
@@ -629,9 +608,8 @@ mod tests {
             let after = std::fs::read_to_string(&path).unwrap();
             assert!(after.contains("mine"), "{}: {after}", tool.id);
             let listed = listed(tool.shape, &after).unwrap();
-            let photo_entry = listed.iter().find(|(n, _)| n == "photocraft").unwrap();
-            assert_eq!(photo_entry.1, Some(("/usr/bin/photocraft-cli".to_string(), vec!["mcp".to_string()])), "{}", tool.id);
-            assert!(listed.iter().any(|(n, _)| n == "other"));
+            assert_eq!(listed["photocraft"], Some(server("/usr/bin/photocraft-cli")), "{}", tool.id);
+            assert!(listed.contains_key("other"));
             match tool.shape {
                 Shape::ClaudeCode => assert!(after.contains("\"type\": \"stdio\"")),
                 Shape::VsCode => assert!(after.contains("\"servers\"") && after.contains("\"type\": \"stdio\"")),
